@@ -1,0 +1,5 @@
+Case,City,PV Size kW,Battery Size kWh,System Cost EUR,Annual Benefit EUR,Payback Years,NPV EUR
+Base Case,Freiburg,7,8,14300.0,1761.0,8.12,5279.48
+Electricity Price +20%,Freiburg,7,8,14300.0,2080.2,6.87,8828.47
+Battery Cost -20%,Freiburg,7,8,13260.0,1771.4,7.49,6435.11
+Feed-in Tariff -20%,Freiburg,7,8,14300.0,1699.4,8.41,4594.59
