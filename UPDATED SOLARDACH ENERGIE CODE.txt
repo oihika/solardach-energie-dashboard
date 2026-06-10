@@ -1,0 +1,986 @@
+# ============================================================
+# SOLARDACH ENERGIE DASHBOARD - ONE CELL DIRECT RUN VERSION
+# Author: Oihika Arpit
+# Works in Google Colab
+# ============================================================
+
+!pip install -q requests pandas numpy plotly matplotlib
+
+from pathlib import Path
+import zipfile
+import warnings
+import requests
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import matplotlib.pyplot as plt
+from IPython.display import display, HTML
+from google.colab import files
+
+warnings.filterwarnings("ignore")
+
+# ============================================================
+# PROJECT SETTINGS
+# ============================================================
+
+PROJECT_NAME = "Solardach Energie Dashboard"
+AUTHOR_NAME = "Oihika Arpit"
+
+OUTPUT_DIR = Path("/content/solardach_energie_dashboard_outputs")
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+NASA_POWER_URL = "https://power.larc.nasa.gov/api/temporal/hourly/point"
+
+# Change these values manually as needed
+CITY = "Freiburg"
+YEAR = 2024
+SYSTEM_KWP = 7.0
+BATTERY_KWH = 8.0
+ANNUAL_LOAD_KWH = 4200
+TARIFF_NAME = "BDEW average household"
+PERFORMANCE_RATIO = 0.82
+ROUNDTRIP_EFFICIENCY = 0.90
+BATTERY_C_RATE = 0.50
+REFRESH_NASA_DATA = False
+
+GERMAN_CITIES = {
+    "Berlin": {"tier": "Tier 1", "lat": 52.5200, "lon": 13.4050},
+    "Munich": {"tier": "Tier 1", "lat": 48.1351, "lon": 11.5820},
+    "Hamburg": {"tier": "Tier 1", "lat": 53.5511, "lon": 9.9937},
+    "Freiburg": {"tier": "Tier 2", "lat": 47.9990, "lon": 7.8421},
+    "Leipzig": {"tier": "Tier 2", "lat": 51.3397, "lon": 12.3731},
+    "Dresden": {"tier": "Tier 2", "lat": 51.0504, "lon": 13.7373},
+    "Oldenburg": {"tier": "Tier 3", "lat": 53.1435, "lon": 8.2146},
+    "Cottbus": {"tier": "Tier 3", "lat": 51.7563, "lon": 14.3329},
+    "Passau": {"tier": "Tier 3", "lat": 48.5667, "lon": 13.4319},
+}
+
+GERMAN_TARIFFS_2026 = {
+    "BDEW average household": {
+        "import_price": 0.3700,
+        "feed_in_price": 0.0778,
+        "standing_charge": 130
+    },
+    "Low-cost new contract": {
+        "import_price": 0.2683,
+        "feed_in_price": 0.0778,
+        "standing_charge": 120
+    },
+    "Basic supply / Grundversorgung": {
+        "import_price": 0.4283,
+        "feed_in_price": 0.0778,
+        "standing_charge": 150
+    },
+    "Conservative 10-40 kWp case": {
+        "import_price": 0.3400,
+        "feed_in_price": 0.0673,
+        "standing_charge": 130
+    },
+}
+
+# ============================================================
+# FORMAT HELPERS
+# ============================================================
+
+def euro(v):
+    return f"EUR {v:,.0f}"
+
+def kwh(v):
+    return f"{v:,.0f} kWh"
+
+def pct(v):
+    return f"{v * 100:.1f}%"
+
+# ============================================================
+# NASA POWER DATA OR FALLBACK SYNTHETIC DATA
+# ============================================================
+
+def create_synthetic_solar_data(city, year):
+    print("NASA POWER failed or unavailable. Creating synthetic solar profile for testing...")
+
+    dates = pd.date_range(
+        start=f"{year}-01-01 00:00:00",
+        end=f"{year}-12-31 23:00:00",
+        freq="H"
+    )
+
+    day_of_year = dates.dayofyear.to_numpy()
+    hour = dates.hour.to_numpy()
+
+    seasonal_factor = 0.55 + 0.45 * np.sin(2 * np.pi * (day_of_year - 80) / 365)
+    seasonal_factor = np.clip(seasonal_factor, 0.18, 1.0)
+
+    daylight_shape = np.sin(np.pi * (hour - 5) / 14)
+    daylight_shape = np.clip(daylight_shape, 0, None)
+
+    cloud_noise = np.random.default_rng(42).normal(0.85, 0.18, len(dates))
+    cloud_noise = np.clip(cloud_noise, 0.35, 1.05)
+
+    irradiance = 850 * daylight_shape * seasonal_factor * cloud_noise
+    irradiance = np.clip(irradiance, 0, None)
+
+    df = pd.DataFrame({
+        "datetime": dates,
+        "solar_irradiance_wh_m2": irradiance
+    })
+
+    return df
+
+def fetch_nasa_power_hourly(city, year, refresh=False):
+    info = GERMAN_CITIES[city]
+    cache_path = OUTPUT_DIR / f"nasa_power_{city.lower()}_{year}.csv"
+
+    if cache_path.exists() and not refresh:
+        print("Using cached NASA POWER data.")
+        return pd.read_csv(cache_path, parse_dates=["datetime"])
+
+    try:
+        params = {
+            "parameters": "ALLSKY_SFC_SW_DWN",
+            "community": "RE",
+            "longitude": info["lon"],
+            "latitude": info["lat"],
+            "start": f"{year}0101",
+            "end": f"{year}1231",
+            "format": "JSON",
+            "time-standard": "LST",
+        }
+
+        response = requests.get(NASA_POWER_URL, params=params, timeout=90)
+        response.raise_for_status()
+
+        data = response.json()["properties"]["parameter"]["ALLSKY_SFC_SW_DWN"]
+
+        rows = []
+        for key, value in data.items():
+            dt = pd.to_datetime(key, format="%Y%m%d%H")
+            solar = 0 if value == -999 else float(value)
+            rows.append({
+                "datetime": dt,
+                "solar_irradiance_wh_m2": solar
+            })
+
+        df = pd.DataFrame(rows).sort_values("datetime")
+        df.to_csv(cache_path, index=False)
+
+        return df
+
+    except Exception as e:
+        print("NASA POWER error:", e)
+        return create_synthetic_solar_data(city, year)
+
+# ============================================================
+# DEMAND PROFILE
+# ============================================================
+
+def create_hourly_demand_profile(datetimes, annual_demand_kwh):
+    idx = pd.DatetimeIndex(datetimes)
+
+    hour = idx.hour.to_numpy()
+    month = idx.month.to_numpy()
+    weekday = idx.weekday.to_numpy()
+
+    morning_peak = np.exp(-0.5 * ((hour - 7) / 2.2) ** 2)
+    evening_peak = 1.45 * np.exp(-0.5 * ((hour - 19) / 3.0) ** 2)
+    base_load = 0.45 + morning_peak + evening_peak
+
+    winter_boost = np.where(np.isin(month, [11, 12, 1, 2]), 1.18, 1.0)
+    shoulder_boost = np.where(np.isin(month, [3, 4, 9, 10]), 1.05, 1.0)
+    summer_reduction = np.where(np.isin(month, [6, 7, 8]), 0.90, 1.0)
+    weekend_boost = np.where(weekday >= 5, 1.08, 1.0)
+
+    profile = base_load * winter_boost * shoulder_boost * summer_reduction * weekend_boost
+    profile = np.asarray(profile, dtype=float)
+    profile = profile / profile.sum()
+
+    return profile * annual_demand_kwh
+
+# ============================================================
+# PV + BATTERY SIMULATION
+# ============================================================
+
+def simulate_pv_battery(
+    solar_df,
+    system_kwp,
+    battery_kwh,
+    annual_demand_kwh,
+    performance_ratio=0.82,
+    roundtrip_efficiency=0.90,
+    battery_c_rate=0.50
+):
+    df = solar_df.copy()
+
+    df["datetime"] = pd.to_datetime(df["datetime"])
+
+    df["demand_kwh"] = create_hourly_demand_profile(
+        df["datetime"],
+        annual_demand_kwh
+    )
+
+    df["pv_generation_kwh"] = (
+        df["solar_irradiance_wh_m2"] / 1000
+        * system_kwp
+        * performance_ratio
+    )
+
+    charge_eff = roundtrip_efficiency ** 0.5
+    discharge_eff = roundtrip_efficiency ** 0.5
+    max_battery_power_kw = battery_kwh * battery_c_rate if battery_kwh > 0 else 0
+
+    soc = 0
+    records = []
+
+    for _, row in df.iterrows():
+        pv = float(row["pv_generation_kwh"])
+        demand = float(row["demand_kwh"])
+
+        direct_self = min(pv, demand)
+        surplus = max(pv - direct_self, 0)
+        deficit = max(demand - direct_self, 0)
+
+        battery_charge = 0
+        battery_discharge = 0
+        grid_export = 0
+        grid_import = 0
+
+        if battery_kwh > 0:
+            charge_room = battery_kwh - soc
+            charge_from_surplus = min(surplus, max_battery_power_kw)
+            battery_charge = min(charge_from_surplus * charge_eff, charge_room)
+
+            surplus_after_charge = surplus - battery_charge / charge_eff
+            grid_export = max(surplus_after_charge, 0)
+
+            soc += battery_charge
+
+            battery_discharge = min(deficit, max_battery_power_kw, soc * discharge_eff)
+            soc -= battery_discharge / discharge_eff
+
+            grid_import = max(deficit - battery_discharge, 0)
+
+        else:
+            grid_export = surplus
+            grid_import = deficit
+
+        records.append({
+            "direct_self_consumption_kwh": direct_self,
+            "battery_charge_kwh": battery_charge,
+            "battery_discharge_to_load_kwh": battery_discharge,
+            "grid_import_kwh": grid_import,
+            "grid_export_kwh": grid_export,
+            "battery_soc_kwh": soc,
+        })
+
+    result = pd.concat(
+        [df.reset_index(drop=True), pd.DataFrame(records)],
+        axis=1
+    )
+
+    result["total_self_consumed_kwh"] = (
+        result["direct_self_consumption_kwh"]
+        + result["battery_discharge_to_load_kwh"]
+    )
+
+    result["hour"] = result["datetime"].dt.hour
+    result["date"] = result["datetime"].dt.date
+    result["month"] = result["datetime"].dt.month
+
+    return result
+
+# ============================================================
+# ECONOMICS
+# ============================================================
+
+def calculate_economics(sim_df, tariff_name, system_kwp, battery_kwh):
+    tariff = GERMAN_TARIFFS_2026[tariff_name]
+
+    annual_demand = sim_df["demand_kwh"].sum()
+    annual_pv = sim_df["pv_generation_kwh"].sum()
+    annual_import = sim_df["grid_import_kwh"].sum()
+    annual_export = sim_df["grid_export_kwh"].sum()
+    annual_self = sim_df["total_self_consumed_kwh"].sum()
+
+    baseline_bill = annual_demand * tariff["import_price"] + tariff["standing_charge"]
+    new_grid_bill = annual_import * tariff["import_price"] + tariff["standing_charge"]
+    feed_in_revenue = annual_export * tariff["feed_in_price"]
+    annual_savings = baseline_bill - new_grid_bill + feed_in_revenue
+
+    pv_cost = system_kwp * 1300
+    battery_cost = battery_kwh * 650
+    installation_cost = 1800
+    total_cost = pv_cost + battery_cost + installation_cost
+
+    payback = total_cost / annual_savings if annual_savings > 0 else np.inf
+    co2_avoided_kg = annual_self * 0.38
+
+    return {
+        "annual_demand_kwh": annual_demand,
+        "annual_pv_generation_kwh": annual_pv,
+        "annual_self_consumed_kwh": annual_self,
+        "annual_grid_import_kwh": annual_import,
+        "annual_grid_export_kwh": annual_export,
+        "self_consumption_rate": annual_self / annual_pv if annual_pv > 0 else 0,
+        "self_sufficiency_rate": annual_self / annual_demand if annual_demand > 0 else 0,
+        "baseline_bill_eur": baseline_bill,
+        "new_grid_bill_eur": new_grid_bill,
+        "feed_in_revenue_eur": feed_in_revenue,
+        "annual_savings_eur": annual_savings,
+        "system_cost_eur": total_cost,
+        "payback_years": payback,
+        "co2_avoided_kg_year": co2_avoided_kg,
+    }
+
+def compare_german_tariffs(sim_df, system_kwp, battery_kwh):
+    rows = []
+
+    for tariff_name in GERMAN_TARIFFS_2026:
+        s = calculate_economics(sim_df, tariff_name, system_kwp, battery_kwh)
+
+        rows.append({
+            "Tariff": tariff_name,
+            "Baseline bill EUR": round(s["baseline_bill_eur"], 2),
+            "Grid bill after PV-BESS EUR": round(s["new_grid_bill_eur"], 2),
+            "Feed-in revenue EUR": round(s["feed_in_revenue_eur"], 2),
+            "Net annual savings EUR": round(s["annual_savings_eur"], 2),
+            "Payback years": round(s["payback_years"], 2),
+        })
+
+    return pd.DataFrame(rows)
+
+# ============================================================
+# MONTHLY SUMMARY
+# ============================================================
+
+def monthly_summary(sim_df):
+    monthly = sim_df.groupby("month").agg({
+        "pv_generation_kwh": "sum",
+        "demand_kwh": "sum",
+        "total_self_consumed_kwh": "sum",
+        "grid_import_kwh": "sum",
+        "grid_export_kwh": "sum",
+    }).reset_index()
+
+    monthly["Month"] = pd.to_datetime(
+        monthly["month"],
+        format="%m"
+    ).dt.strftime("%b")
+
+    return monthly
+
+# ============================================================
+# COLORFUL PLOTLY DASHBOARD
+# ============================================================
+
+def build_colorful_dashboard(city, year, sim_df, summary, tariff_df):
+    city_info = GERMAN_CITIES[city]
+    monthly = monthly_summary(sim_df)
+
+    monthly["co2_avoided_kg"] = monthly["total_self_consumed_kwh"] * 0.38
+
+    best_solar_day = sim_df.groupby("date")["pv_generation_kwh"].sum().idxmax()
+    sample_day = sim_df[sim_df["date"] == best_solar_day]
+
+    week_start = pd.to_datetime(best_solar_day) - pd.Timedelta(days=3)
+    week_end = pd.to_datetime(best_solar_day) + pd.Timedelta(days=3)
+
+    week = sim_df[
+        (pd.to_datetime(sim_df["datetime"]) >= week_start)
+        & (pd.to_datetime(sim_df["datetime"]) <= week_end)
+    ]
+
+    daily = sim_df.groupby("date").agg({
+        "pv_generation_kwh": "sum",
+        "demand_kwh": "sum",
+        "grid_import_kwh": "sum",
+        "grid_export_kwh": "sum",
+        "battery_discharge_to_load_kwh": "sum"
+    }).reset_index()
+
+    energy_flow_labels = [
+        "Self-consumed energy",
+        "Grid import",
+        "Grid export"
+    ]
+
+    energy_flow_values = [
+        summary["annual_self_consumed_kwh"],
+        summary["annual_grid_import_kwh"],
+        summary["annual_grid_export_kwh"]
+    ]
+
+    fig = make_subplots(
+        rows=5,
+        cols=2,
+        specs=[
+            [{"type": "bar"}, {"type": "scatter"}],
+            [{"type": "scatter"}, {"type": "bar"}],
+            [{"type": "bar"}, {"type": "indicator"}],
+            [{"type": "pie"}, {"type": "bar"}],
+            [{"type": "scatter"}, {"type": "bar"}],
+        ],
+        subplot_titles=[
+            "Monthly Energy Balance",
+            f"Best Solar Day Hourly Profile: {best_solar_day}",
+            "Battery State of Charge",
+            "German Tariff Savings Comparison",
+            "Monthly Grid Import vs Export",
+            "Energy Independence Gauge",
+            "Annual Energy Flow Share",
+            "Monthly CO₂ Avoided",
+            "Daily PV Generation Trend",
+            "Payback Period by Tariff"
+        ],
+        vertical_spacing=0.08,
+        horizontal_spacing=0.10
+    )
+
+    fig.add_trace(go.Bar(
+        x=monthly["Month"],
+        y=monthly["demand_kwh"],
+        name="Demand",
+        marker_color="#2563eb",
+        text=monthly["demand_kwh"].round(0),
+        textposition="outside"
+    ), 1, 1)
+
+    fig.add_trace(go.Bar(
+        x=monthly["Month"],
+        y=monthly["pv_generation_kwh"],
+        name="PV generation",
+        marker_color="#f59e0b",
+        text=monthly["pv_generation_kwh"].round(0),
+        textposition="outside"
+    ), 1, 1)
+
+    fig.add_trace(go.Bar(
+        x=monthly["Month"],
+        y=monthly["total_self_consumed_kwh"],
+        name="Self-consumed",
+        marker_color="#10b981",
+        text=monthly["total_self_consumed_kwh"].round(0),
+        textposition="outside"
+    ), 1, 1)
+
+    fig.add_trace(go.Scatter(
+        x=sample_day["hour"],
+        y=sample_day["pv_generation_kwh"],
+        mode="lines+markers",
+        name="Hourly PV",
+        line=dict(color="#f97316", width=4),
+        marker=dict(size=7)
+    ), 1, 2)
+
+    fig.add_trace(go.Scatter(
+        x=sample_day["hour"],
+        y=sample_day["demand_kwh"],
+        mode="lines+markers",
+        name="Hourly demand",
+        line=dict(color="#2563eb", width=4),
+        marker=dict(size=7)
+    ), 1, 2)
+
+    fig.add_trace(go.Scatter(
+        x=sample_day["hour"],
+        y=sample_day["grid_import_kwh"],
+        mode="lines+markers",
+        name="Grid import",
+        line=dict(color="#dc2626", width=3, dash="dot"),
+        marker=dict(size=6)
+    ), 1, 2)
+
+    fig.add_trace(go.Scatter(
+        x=sample_day["hour"],
+        y=sample_day["battery_soc_kwh"],
+        mode="lines+markers",
+        name="Battery SOC",
+        line=dict(color="#7c3aed", width=3),
+        marker=dict(size=6)
+    ), 1, 2)
+
+    fig.add_trace(go.Scatter(
+        x=week["datetime"],
+        y=week["battery_soc_kwh"],
+        mode="lines",
+        name="Battery SOC weekly",
+        line=dict(color="#8b5cf6", width=4),
+        fill="tozeroy",
+        fillcolor="rgba(139,92,246,0.18)"
+    ), 2, 1)
+
+    fig.add_trace(go.Bar(
+        x=tariff_df["Tariff"],
+        y=tariff_df["Net annual savings EUR"],
+        name="Annual savings",
+        marker_color=["#22c55e", "#14b8a6", "#ef4444", "#64748b"],
+        text=tariff_df["Net annual savings EUR"].round(0),
+        textposition="outside"
+    ), 2, 2)
+
+    fig.add_trace(go.Bar(
+        x=monthly["Month"],
+        y=monthly["grid_import_kwh"],
+        name="Grid import monthly",
+        marker_color="#ef4444",
+        text=monthly["grid_import_kwh"].round(0),
+        textposition="outside"
+    ), 3, 1)
+
+    fig.add_trace(go.Bar(
+        x=monthly["Month"],
+        y=monthly["grid_export_kwh"],
+        name="Grid export monthly",
+        marker_color="#facc15",
+        text=monthly["grid_export_kwh"].round(0),
+        textposition="outside"
+    ), 3, 1)
+
+    fig.add_trace(go.Indicator(
+        mode="gauge+number+delta",
+        value=summary["self_sufficiency_rate"] * 100,
+        number={"suffix": "%", "font": {"size": 34}},
+        delta={"reference": 50, "suffix": "%"},
+        gauge={
+            "axis": {"range": [0, 100]},
+            "bar": {"color": "#059669"},
+            "steps": [
+                {"range": [0, 35], "color": "#fee2e2"},
+                {"range": [35, 70], "color": "#fef3c7"},
+                {"range": [70, 100], "color": "#dcfce7"},
+            ],
+            "threshold": {
+                "line": {"color": "#111827", "width": 4},
+                "thickness": 0.75,
+                "value": 80
+            }
+        },
+        title={"text": "Self-sufficiency"}
+    ), 3, 2)
+
+    fig.add_trace(go.Pie(
+        labels=energy_flow_labels,
+        values=energy_flow_values,
+        hole=0.42,
+        name="Energy flow",
+        marker=dict(colors=["#10b981", "#ef4444", "#f59e0b"]),
+        textinfo="label+percent",
+        pull=[0.04, 0.04, 0.04]
+    ), 4, 1)
+
+    fig.add_trace(go.Bar(
+        x=monthly["Month"],
+        y=monthly["co2_avoided_kg"],
+        name="CO₂ avoided",
+        marker_color="#16a34a",
+        text=(monthly["co2_avoided_kg"] / 1000).round(2),
+        textposition="outside"
+    ), 4, 2)
+
+    fig.add_trace(go.Scatter(
+        x=daily["date"],
+        y=daily["pv_generation_kwh"],
+        mode="lines",
+        name="Daily PV generation",
+        line=dict(color="#f97316", width=2),
+        fill="tozeroy",
+        fillcolor="rgba(249,115,22,0.18)"
+    ), 5, 1)
+
+    fig.add_trace(go.Bar(
+        x=tariff_df["Tariff"],
+        y=tariff_df["Payback years"],
+        name="Payback years",
+        marker_color=["#0ea5e9", "#22c55e", "#f43f5e", "#6366f1"],
+        text=tariff_df["Payback years"],
+        textposition="outside"
+    ), 5, 2)
+
+    fig.update_layout(
+        height=1850,
+        template="plotly_white",
+        title=dict(
+            text=(
+                f"{PROJECT_NAME}<br>"
+                f"<sup>{AUTHOR_NAME} | {city} ({city_info['tier']}) | "
+                f"PV {SYSTEM_KWP} kWp | Battery {BATTERY_KWH} kWh | {year}</sup>"
+            ),
+            x=0.5,
+            font=dict(size=30, color="#111827")
+        ),
+        legend=dict(
+            orientation="h",
+            y=-0.035,
+            x=0.5,
+            xanchor="center",
+            font=dict(size=12)
+        ),
+        margin=dict(l=50, r=50, t=150, b=90),
+        paper_bgcolor="#f8fafc",
+        plot_bgcolor="#ffffff",
+        font=dict(family="Arial", size=12, color="#111827")
+    )
+
+    fig.update_xaxes(showgrid=False, tickangle=0)
+    fig.update_yaxes(showgrid=True, gridcolor="rgba(148,163,184,0.25)")
+
+    return fig
+
+# ============================================================
+# SAVE PNG CHARTS
+# ============================================================
+
+def save_png_charts(city, year, sim_df, summary, tariff_df):
+    monthly = monthly_summary(sim_df)
+    monthly["co2_avoided_kg"] = monthly["total_self_consumed_kwh"] * 0.38
+
+    best_solar_day = sim_df.groupby("date")["pv_generation_kwh"].sum().idxmax()
+    sample_day = sim_df[sim_df["date"] == best_solar_day]
+
+    daily = sim_df.groupby("date").agg({
+        "pv_generation_kwh": "sum",
+        "demand_kwh": "sum",
+        "grid_import_kwh": "sum",
+        "grid_export_kwh": "sum",
+    }).reset_index()
+
+    plt.figure(figsize=(14, 8))
+    x = np.arange(len(monthly["Month"]))
+    width = 0.25
+
+    plt.bar(x - width, monthly["demand_kwh"], width, label="Demand", color="#2563eb")
+    plt.bar(x, monthly["pv_generation_kwh"], width, label="PV generation", color="#f59e0b")
+    plt.bar(x + width, monthly["total_self_consumed_kwh"], width, label="Self-consumed", color="#10b981")
+
+    plt.title(f"{PROJECT_NAME}: Monthly Energy Balance - {city} {year}", fontsize=18, weight="bold")
+    plt.ylabel("Energy, kWh")
+    plt.xticks(x, monthly["Month"])
+    plt.legend()
+    plt.grid(axis="y", alpha=0.25)
+    plt.tight_layout()
+    plt.savefig(OUTPUT_DIR / "colorful_monthly_energy_balance.png", dpi=240)
+    plt.close()
+
+    plt.figure(figsize=(14, 8))
+    plt.bar(monthly["Month"], monthly["grid_import_kwh"], label="Grid import", color="#ef4444", alpha=0.85)
+    plt.bar(monthly["Month"], monthly["grid_export_kwh"], label="Grid export", color="#facc15", alpha=0.85)
+
+    plt.title("Monthly Grid Import vs Export", fontsize=18, weight="bold")
+    plt.ylabel("Energy, kWh")
+    plt.legend()
+    plt.grid(axis="y", alpha=0.25)
+    plt.tight_layout()
+    plt.savefig(OUTPUT_DIR / "colorful_grid_import_export.png", dpi=240)
+    plt.close()
+
+    plt.figure(figsize=(14, 8))
+    plt.plot(sample_day["hour"], sample_day["pv_generation_kwh"], label="PV generation", color="#f97316", linewidth=4, marker="o")
+    plt.plot(sample_day["hour"], sample_day["demand_kwh"], label="Demand", color="#2563eb", linewidth=4, marker="o")
+    plt.plot(sample_day["hour"], sample_day["battery_soc_kwh"], label="Battery SOC", color="#7c3aed", linewidth=3, marker="o")
+    plt.plot(sample_day["hour"], sample_day["grid_import_kwh"], label="Grid import", color="#dc2626", linewidth=3, linestyle="--", marker="o")
+
+    plt.title(f"Hourly PV-Battery-Grid Simulation on Best Solar Day: {best_solar_day}", fontsize=18, weight="bold")
+    plt.xlabel("Hour of day")
+    plt.ylabel("Energy, kWh")
+    plt.legend()
+    plt.grid(alpha=0.25)
+    plt.tight_layout()
+    plt.savefig(OUTPUT_DIR / "colorful_hourly_pv_battery_grid.png", dpi=240)
+    plt.close()
+
+    plt.figure(figsize=(14, 8))
+    plt.bar(
+        tariff_df["Tariff"],
+        tariff_df["Net annual savings EUR"],
+        color=["#22c55e", "#14b8a6", "#ef4444", "#64748b"]
+    )
+
+    plt.title("German Tariff Comparison: Net Annual Savings", fontsize=18, weight="bold")
+    plt.ylabel("Annual savings, EUR")
+    plt.xticks(rotation=20, ha="right")
+    plt.grid(axis="y", alpha=0.25)
+    plt.tight_layout()
+    plt.savefig(OUTPUT_DIR / "colorful_tariff_savings_comparison.png", dpi=240)
+    plt.close()
+
+    plt.figure(figsize=(14, 8))
+    plt.bar(
+        tariff_df["Tariff"],
+        tariff_df["Payback years"],
+        color=["#0ea5e9", "#22c55e", "#f43f5e", "#6366f1"]
+    )
+
+    plt.title("Payback Period Comparison by Tariff", fontsize=18, weight="bold")
+    plt.ylabel("Payback period, years")
+    plt.xticks(rotation=20, ha="right")
+    plt.grid(axis="y", alpha=0.25)
+    plt.tight_layout()
+    plt.savefig(OUTPUT_DIR / "colorful_payback_comparison.png", dpi=240)
+    plt.close()
+
+    plt.figure(figsize=(14, 8))
+    plt.bar(monthly["Month"], monthly["co2_avoided_kg"] / 1000, color="#16a34a")
+
+    plt.title("Monthly CO₂ Avoided by PV Self-Consumption", fontsize=18, weight="bold")
+    plt.ylabel("CO₂ avoided, tonnes")
+    plt.grid(axis="y", alpha=0.25)
+    plt.tight_layout()
+    plt.savefig(OUTPUT_DIR / "colorful_monthly_co2_avoided.png", dpi=240)
+    plt.close()
+
+    plt.figure(figsize=(14, 8))
+    plt.plot(daily["date"], daily["pv_generation_kwh"], color="#f97316", linewidth=2)
+    plt.fill_between(daily["date"], daily["pv_generation_kwh"], color="#fed7aa", alpha=0.45)
+
+    plt.title("Daily PV Generation Trend Across the Year", fontsize=18, weight="bold")
+    plt.xlabel("Date")
+    plt.ylabel("Daily PV generation, kWh")
+    plt.grid(alpha=0.25)
+    plt.tight_layout()
+    plt.savefig(OUTPUT_DIR / "colorful_daily_pv_generation_trend.png", dpi=240)
+    plt.close()
+
+    flow_labels = ["Self-consumed", "Grid import", "Grid export"]
+    flow_values = [
+        summary["annual_self_consumed_kwh"],
+        summary["annual_grid_import_kwh"],
+        summary["annual_grid_export_kwh"]
+    ]
+
+    plt.figure(figsize=(9, 9))
+    plt.pie(
+        flow_values,
+        labels=flow_labels,
+        autopct="%1.1f%%",
+        startangle=90,
+        colors=["#10b981", "#ef4444", "#f59e0b"],
+        wedgeprops={"edgecolor": "white", "linewidth": 2}
+    )
+
+    plt.title("Annual Energy Flow Share", fontsize=18, weight="bold")
+    plt.tight_layout()
+    plt.savefig(OUTPUT_DIR / "colorful_annual_energy_flow_pie.png", dpi=240)
+    plt.close()
+
+# ============================================================
+# SAVE OUTPUT FILES
+# ============================================================
+
+def save_outputs(city, year, sim_df, summary, tariff_df, dashboard_fig):
+    sim_df.to_csv(OUTPUT_DIR / "hourly_pv_bess_simulation.csv", index=False)
+    monthly_summary(sim_df).to_csv(OUTPUT_DIR / "monthly_energy_summary.csv", index=False)
+    tariff_df.to_csv(OUTPUT_DIR / "german_tariff_comparison.csv", index=False)
+
+    dashboard_fig.write_html(OUTPUT_DIR / "colorful_solardach_dashboard.html")
+
+    save_png_charts(city, year, sim_df, summary, tariff_df)
+
+    readme = f"""
+{PROJECT_NAME}
+Author: {AUTHOR_NAME}
+
+Project Type:
+Solar rooftop PV + Battery Energy Storage simulation dashboard for German cities.
+
+Selected Parameters:
+City: {city}
+Year: {year}
+PV system size: {SYSTEM_KWP} kWp
+Battery size: {BATTERY_KWH} kWh
+Annual household load: {ANNUAL_LOAD_KWH} kWh
+Tariff scenario: {TARIFF_NAME}
+
+Main Results:
+Annual demand: {summary['annual_demand_kwh']:,.0f} kWh
+Annual PV generation: {summary['annual_pv_generation_kwh']:,.0f} kWh
+Annual self-consumed energy: {summary['annual_self_consumed_kwh']:,.0f} kWh
+Annual grid import: {summary['annual_grid_import_kwh']:,.0f} kWh
+Annual grid export: {summary['annual_grid_export_kwh']:,.0f} kWh
+Self-consumption rate: {summary['self_consumption_rate'] * 100:.1f}%
+Self-sufficiency rate: {summary['self_sufficiency_rate'] * 100:.1f}%
+Annual savings: EUR {summary['annual_savings_eur']:,.0f}
+System cost: EUR {summary['system_cost_eur']:,.0f}
+Payback period: {summary['payback_years']:.2f} years
+CO2 avoided annually: {summary['co2_avoided_kg_year'] / 1000:.2f} tonnes
+
+Output Files:
+1. hourly_pv_bess_simulation.csv
+2. monthly_energy_summary.csv
+3. german_tariff_comparison.csv
+4. colorful_solardach_dashboard.html
+5. colorful_monthly_energy_balance.png
+6. colorful_grid_import_export.png
+7. colorful_hourly_pv_battery_grid.png
+8. colorful_tariff_savings_comparison.png
+9. colorful_payback_comparison.png
+10. colorful_monthly_co2_avoided.png
+11. colorful_daily_pv_generation_trend.png
+12. colorful_annual_energy_flow_pie.png
+
+How to Explain This Project:
+This project compares rooftop solar generation, household demand, battery storage, grid import, grid export, tariff savings, payback period, and CO2 reduction for German cities. It is useful for MSc Renewable Energy, smart grid, solar PV, energy management, and battery storage profile building.
+"""
+
+    (OUTPUT_DIR / "README_project_summary.txt").write_text(
+        readme.strip(),
+        encoding="utf-8"
+    )
+
+    zip_path = Path("/content/solardach_energie_dashboard_outputs.zip")
+
+    if zip_path.exists():
+        zip_path.unlink()
+
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+        for p in sorted(OUTPUT_DIR.iterdir()):
+            if p.is_file():
+                z.write(p, arcname=p.name)
+
+    return zip_path
+
+# ============================================================
+# MAIN RUN
+# ============================================================
+
+print("============================================================")
+print("Starting Solardach Energie Dashboard")
+print("Author:", AUTHOR_NAME)
+print("============================================================")
+
+print("Step 1: Loading solar data...")
+
+solar_df = fetch_nasa_power_hourly(
+    CITY,
+    YEAR,
+    refresh=REFRESH_NASA_DATA
+)
+
+print("Solar data loaded.")
+print("Rows:", len(solar_df))
+print(solar_df.head())
+
+print("Step 2: Running PV + battery simulation...")
+
+sim_df = simulate_pv_battery(
+    solar_df,
+    system_kwp=SYSTEM_KWP,
+    battery_kwh=BATTERY_KWH,
+    annual_demand_kwh=ANNUAL_LOAD_KWH,
+    performance_ratio=PERFORMANCE_RATIO,
+    roundtrip_efficiency=ROUNDTRIP_EFFICIENCY,
+    battery_c_rate=BATTERY_C_RATE
+)
+
+print("Simulation complete.")
+
+print("Step 3: Calculating economic results...")
+
+summary = calculate_economics(
+    sim_df,
+    TARIFF_NAME,
+    SYSTEM_KWP,
+    BATTERY_KWH
+)
+
+tariff_df = compare_german_tariffs(
+    sim_df,
+    SYSTEM_KWP,
+    BATTERY_KWH
+)
+
+print("Economic calculation complete.")
+
+print("Step 4: Displaying professional summary card...")
+
+display(HTML(f"""
+<div style="
+    font-family:Arial;
+    padding:30px;
+    border-radius:22px;
+    background:linear-gradient(135deg,#020617,#0f766e,#f59e0b);
+    color:white;
+    margin-bottom:20px;
+    box-shadow:0 8px 26px rgba(15,23,42,.25);
+">
+    <div style="font-size:18px; opacity:.95;">{AUTHOR_NAME}</div>
+
+    <div style="font-size:44px; font-weight:900; margin-top:5px;">
+        {PROJECT_NAME}
+    </div>
+
+    <div style="font-size:22px; font-weight:600; margin-top:8px;">
+        City: {CITY} | Year: {YEAR} | PV: {SYSTEM_KWP} kWp | Battery: {BATTERY_KWH} kWh
+    </div>
+
+    <div style="
+        display:grid;
+        grid-template-columns:repeat(4,1fr);
+        gap:14px;
+        margin-top:24px;
+    ">
+        <div style="background:rgba(255,255,255,.18); padding:16px; border-radius:14px;">
+            <div>PV Generation</div>
+            <div style="font-size:28px; font-weight:900;">
+                {summary['annual_pv_generation_kwh']:,.0f} kWh
+            </div>
+        </div>
+
+        <div style="background:rgba(255,255,255,.18); padding:16px; border-radius:14px;">
+            <div>Self-Sufficiency</div>
+            <div style="font-size:28px; font-weight:900;">
+                {summary['self_sufficiency_rate'] * 100:.1f}%
+            </div>
+        </div>
+
+        <div style="background:rgba(255,255,255,.18); padding:16px; border-radius:14px;">
+            <div>Annual Savings</div>
+            <div style="font-size:28px; font-weight:900;">
+                EUR {summary['annual_savings_eur']:,.0f}
+            </div>
+        </div>
+
+        <div style="background:rgba(255,255,255,.18); padding:16px; border-radius:14px;">
+            <div>CO₂ Avoided</div>
+            <div style="font-size:28px; font-weight:900;">
+                {summary['co2_avoided_kg_year']/1000:.2f} t
+            </div>
+        </div>
+    </div>
+</div>
+"""))
+
+print("Step 5: Building colorful dashboard...")
+
+dashboard_fig = build_colorful_dashboard(
+    CITY,
+    YEAR,
+    sim_df,
+    summary,
+    tariff_df
+)
+
+dashboard_fig.show()
+
+print("Step 6: Displaying tariff comparison table...")
+display(tariff_df)
+
+print("Step 7: Displaying first 24 rows of simulation...")
+display(sim_df.head(24).round(3))
+
+print("Step 8: Saving CSV, PNG, HTML and ZIP outputs...")
+
+zip_path = save_outputs(
+    CITY,
+    YEAR,
+    sim_df,
+    summary,
+    tariff_df,
+    dashboard_fig
+)
+
+print("============================================================")
+print("All outputs generated successfully.")
+print("ZIP file location:", zip_path)
+print("Downloading ZIP file now...")
+print("============================================================")
+
+files.download(str(zip_path))
